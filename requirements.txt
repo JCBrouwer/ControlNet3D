@@ -1,0 +1,13 @@
+-f https://download.pytorch.org/whl/torch.html
+torch
+torchvision
+accelerate
+datasets
+transformers
+git+https://github.com/huggingface/diffusers.git
+xformers
+bitsandbytes
+yt-dlp
+av
+jsonlines
+einops
