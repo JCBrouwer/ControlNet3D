@@ -20,6 +20,7 @@ import os
 import random
 import shutil
 from pathlib import Path
+from typing import Tuple
 
 import accelerate
 import diffusers
@@ -40,6 +41,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
+from torchvision.io import read_video, write_video
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -53,17 +55,6 @@ if is_wandb_available():
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__)
-
-
-def video_grid(imgs, rows, cols):
-    assert len(imgs) == rows * cols
-
-    w, h = imgs[0].size
-    grid = Video.new("RGB", size=(cols * w, rows * h))
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    return grid
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -110,10 +101,10 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     video_logs = []
 
     for validation_prompt, validation_video in zip(validation_prompts, validation_videos):
-        validation_video = Video.open(validation_video).convert("RGB")
+        validation_video, _, _ = read_video(validation_video, pts_unit="sec", output_format="TCHW")
+        validation_video = validation_video.permute(1, 0, 2, 3).unsqueeze(0).to(accelerator.device)
 
         videos = []
-
         for _ in range(args.num_validation_videos):
             with torch.autocast("cuda"):
                 video = pipeline(
@@ -154,7 +145,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 formatted_videos.append(wandb.Video(validation_video, caption="Controlnet conditioning"))
 
                 for video in videos:
-                    video = wandb.Video(video, caption=validation_prompt)
+                    video = wandb.Video(video.permute(0, 3, 1, 2), caption=validation_prompt)
                     formatted_videos.append(video)
 
             tracker.log({"validation": formatted_videos})
@@ -185,18 +176,18 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
 
 def save_model_card(repo_id: str, video_logs=None, base_model=str, repo_folder=None):
-    img_str = ""
+    vids_str = ""
     if video_logs is not None:
-        img_str = "You can find some example videos below.\n"
+        vids_str = "You can find some example videos below.\n"
         for i, log in enumerate(video_logs):
-            videos = log["videos"]
             validation_prompt = log["validation_prompt"]
             validation_video = log["validation_video"]
-            validation_video.save(os.path.join(repo_folder, "video_control.png"))
-            img_str += f"prompt: {validation_prompt}\n"
-            videos = [validation_video] + videos
-            video_grid(videos, 1, len(videos)).save(os.path.join(repo_folder, f"videos_{i}.png"))
-            img_str += f"![videos_{i})](./videos_{i}.png)\n"
+            videos = log["videos"]
+            write_video(validation_video, os.path.join(repo_folder, f"video_control_{i}.mp4"))
+            write_video(torch.cat(videos, dim=2), os.path.join(repo_folder, f"video_{i}.mp4"))
+            vids_str += f"prompt: {validation_prompt}\n"
+            vids_str += f"control: ![video_control_{i})](./video_control_{i}.mp4)\n"
+            vids_str += f"results: ![videos_{i}](./videos_{i}.mp4)\n"
 
     yaml = f"""
 ---
@@ -215,7 +206,7 @@ inference: true
 # controlnet-{repo_id}
 
 These are controlnet weights trained on {base_model} with new type of conditioning.
-{img_str}
+{vids_str}
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
@@ -268,8 +259,8 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
-        type=int,
-        default=512,
+        type=Tuple[int, int],
+        default=(640, 360),
         help=(
             "The resolution for input videos, all the videos in the train/validation dataset will be resized to this"
             " resolution"
@@ -582,17 +573,10 @@ def make_train_dataset(args, tokenizer, accelerator):
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
+        dataset = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir)
     else:
         if args.train_data_dir is not None:
-            dataset = load_dataset(
-                args.train_data_dir,
-                cache_dir=args.cache_dir,
-            )
+            dataset = load_dataset(args.train_data_dir, cache_dir=args.cache_dir)
         # See more about loading custom videos at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
@@ -671,11 +655,8 @@ def make_train_dataset(args, tokenizer, accelerator):
     )
 
     def preprocess_train(examples):
-        videos = [video.convert("RGB") for video in examples[video_column]]
-        videos = [video_transforms(video) for video in videos]
-
-        conditioning_videos = [video.convert("RGB") for video in examples[conditioning_video_column]]
-        conditioning_videos = [conditioning_video_transforms(video) for video in conditioning_videos]
+        videos = [video_transforms(video) for video in examples[video_column]]
+        conditioning_videos = [conditioning_video_transforms(video) for video in examples[conditioning_video_column]]
 
         examples["pixel_values"] = videos
         examples["conditioning_pixel_values"] = conditioning_videos
@@ -723,7 +704,7 @@ def main(args):
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
+        datefmt="%Y/%m/%d %H:%M:%S",
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
