@@ -10,3 +10,4 @@ bitsandbytes
 yt-dlp
 av
 jsonlines
+einops
