@@ -17,13 +17,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.attention_processor import (AttentionProcessor,
-                                                  AttnProcessor)
+from diffusers.models.attention_processor import AttentionProcessor, AttnProcessor
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_3d_blocks import (CrossAttnDownBlock3D, DownBlock3D,
-                                             UNetMidBlock3DCrossAttn,
-                                             get_down_block)
+from diffusers.models.unet_3d_blocks import CrossAttnDownBlock3D, DownBlock3D, UNetMidBlock3DCrossAttn, get_down_block
 from diffusers.models.unet_3d_condition import UNet3DConditionModel
 from diffusers.utils import BaseOutput, logging
 from einops import rearrange
@@ -33,25 +30,14 @@ from torch.nn import functional as F
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-
 class PseudoConv3d(nn.Conv2d):
     def __init__(self, in_channels, out_channels, kernel_size, temporal_kernel_size=None, **kwargs):
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            **kwargs
-        )
+        super().__init__(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, **kwargs)
         if temporal_kernel_size is None:
             temporal_kernel_size = kernel_size
 
         self.conv_temporal = (
-            nn.Conv1d(
-                out_channels,
-                out_channels,
-                kernel_size=temporal_kernel_size,
-                padding=temporal_kernel_size // 2
-            )
+            nn.Conv1d(out_channels, out_channels, kernel_size=temporal_kernel_size, padding=temporal_kernel_size // 2)
             if kernel_size > 1
             else None
         )
@@ -67,7 +53,7 @@ class PseudoConv3d(nn.Conv2d):
         if is_video:
             x = rearrange(x, "b c f h w -> (b f) c h w")
 
-        x = super().forward(x)  
+        x = super().forward(x)
 
         if is_video:
             x = rearrange(x, "(b f) c h w -> b c f h w", b=b)
@@ -79,7 +65,7 @@ class PseudoConv3d(nn.Conv2d):
 
         x = rearrange(x, "b c f h w -> (b h w) c f")
 
-        x = self.conv_temporal(x)   
+        x = self.conv_temporal(x)
 
         x = rearrange(x, "(b h w) c f -> b c f h w", h=h, w=w)
 
