@@ -23,10 +23,53 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.unet_3d_blocks import CrossAttnDownBlock3D, DownBlock3D, UNetMidBlock3DCrossAttn, get_down_block
 from diffusers.models.unet_3d_condition import UNet3DConditionModel
 from diffusers.utils import BaseOutput, logging
+from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+class PseudoConv3d(nn.Conv2d):
+    def __init__(self, in_channels, out_channels, kernel_size, temporal_kernel_size=None, **kwargs):
+        super().__init__(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, **kwargs)
+        if temporal_kernel_size is None:
+            temporal_kernel_size = kernel_size
+
+        self.conv_temporal = (
+            nn.Conv1d(out_channels, out_channels, kernel_size=temporal_kernel_size, padding=temporal_kernel_size // 2)
+            if kernel_size > 1
+            else None
+        )
+
+        if self.conv_temporal is not None:
+            nn.init.dirac_(self.conv_temporal.weight.data)  # initialized to be identity
+            nn.init.zeros_(self.conv_temporal.bias.data)
+
+    def forward(self, x):
+        b = x.shape[0]
+
+        is_video = x.ndim == 5
+        if is_video:
+            x = rearrange(x, "b c f h w -> (b f) c h w")
+
+        x = super().forward(x)
+
+        if is_video:
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=b)
+
+        if self.conv_temporal is None or not is_video:
+            return x
+
+        *_, h, w = x.shape
+
+        x = rearrange(x, "b c f h w -> (b h w) c f")
+
+        x = self.conv_temporal(x)
+
+        x = rearrange(x, "(b h w) c f -> b c f h w", h=h, w=w)
+
+        return x
 
 
 @dataclass
@@ -53,18 +96,18 @@ class ControlNet3DConditioningEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.conv_in = nn.Conv3d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
+        self.conv_in = PseudoConv3d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
 
         self.blocks = nn.ModuleList([])
 
         for i in range(len(block_out_channels) - 1):
             channel_in = block_out_channels[i]
             channel_out = block_out_channels[i + 1]
-            self.blocks.append(nn.Conv3d(channel_in, channel_in, kernel_size=3, padding=1))
-            self.blocks.append(nn.Conv3d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
+            self.blocks.append(PseudoConv3d(channel_in, channel_in, kernel_size=3, padding=1))
+            self.blocks.append(PseudoConv3d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
 
         self.conv_out = zero_module(
-            nn.Conv3d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
+            PseudoConv3d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
         )
 
     def forward(self, conditioning):
@@ -150,7 +193,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         # input
         conv_in_kernel = 3
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = nn.Conv3d(
+        self.conv_in = PseudoConv3d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
 
@@ -211,7 +254,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         # down
         output_channel = block_out_channels[0]
 
-        controlnet_block = nn.Conv3d(output_channel, output_channel, kernel_size=1)
+        controlnet_block = PseudoConv3d(output_channel, output_channel, kernel_size=1)
         controlnet_block = zero_module(controlnet_block)
         self.controlnet_down_blocks.append(controlnet_block)
 
@@ -242,19 +285,19 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             self.down_blocks.append(down_block)
 
             for _ in range(layers_per_block):
-                controlnet_block = nn.Conv3d(output_channel, output_channel, kernel_size=1)
+                controlnet_block = PseudoConv3d(output_channel, output_channel, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
                 self.controlnet_down_blocks.append(controlnet_block)
 
             if not is_final_block:
-                controlnet_block = nn.Conv3d(output_channel, output_channel, kernel_size=1)
+                controlnet_block = PseudoConv3d(output_channel, output_channel, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
                 self.controlnet_down_blocks.append(controlnet_block)
 
         # mid
         mid_block_channel = block_out_channels[-1]
 
-        controlnet_block = nn.Conv3d(mid_block_channel, mid_block_channel, kernel_size=1)
+        controlnet_block = PseudoConv3d(mid_block_channel, mid_block_channel, kernel_size=1)
         controlnet_block = zero_module(controlnet_block)
         self.controlnet_mid_block = controlnet_block
 

@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import AutoencoderKL, UNet3DConditionModel
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.text_to_video_synthesis import TextToVideoSDPipelineOutput
 from diffusers.schedulers import KarrasDiffusionSchedulers
@@ -35,7 +36,7 @@ from diffusers.utils import (
 )
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from controlnet3d import ControlNet3DModel, MultiControlNet3DModel
+from controlnet3d import ControlNet3DModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -104,13 +105,13 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: UNet3DConditionModel,
-        controlnet: Union[ControlNet3DModel, List[ControlNet3DModel], Tuple[ControlNet3DModel], MultiControlNet3DModel],
+        controlnet: Union[ControlNet3DModel, List[ControlNet3DModel], Tuple[ControlNet3DModel], MultiControlNetModel],
         scheduler: KarrasDiffusionSchedulers,
     ):
         super().__init__()
 
         if isinstance(controlnet, (list, tuple)):
-            controlnet = MultiControlNet3DModel(controlnet)
+            controlnet = MultiControlNetModel(controlnet)
 
         self.register_modules(
             vae=vae,
@@ -474,7 +475,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
 
         # `prompt` needs more sophisticated handling when there are multiple
         # conditionings.
-        if isinstance(self.controlnet, MultiControlNet3DModel):
+        if isinstance(self.controlnet, MultiControlNetModel):
             if isinstance(prompt, list):
                 logger.warning(
                     f"You have {len(self.controlnet.nets)} ControlNet3Ds and you have passed {len(prompt)}"
@@ -492,9 +493,9 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
         ):
             self.check_video(video, prompt, prompt_embeds)
         elif (
-            isinstance(self.controlnet, MultiControlNet3DModel)
+            isinstance(self.controlnet, MultiControlNetModel)
             or is_compiled
-            and isinstance(self.controlnet._orig_mod, MultiControlNet3DModel)
+            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
         ):
             if not isinstance(video, list):
                 raise TypeError("For multiple controlnets: `video` must be type `list`")
@@ -522,9 +523,9 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
             if not isinstance(controlnet_conditioning_scale, float):
                 raise TypeError("For single controlnet: `controlnet_conditioning_scale` must be type `float`.")
         elif (
-            isinstance(self.controlnet, MultiControlNet3DModel)
+            isinstance(self.controlnet, MultiControlNetModel)
             or is_compiled
-            and isinstance(self.controlnet._orig_mod, MultiControlNet3DModel)
+            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
         ):
             if isinstance(controlnet_conditioning_scale, list):
                 if any(isinstance(i, list) for i in controlnet_conditioning_scale):
@@ -771,7 +772,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
 
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
-        if isinstance(controlnet, MultiControlNet3DModel) and isinstance(controlnet_conditioning_scale, float):
+        if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
             controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
 
         # 3. Encode input prompt
@@ -802,7 +803,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
                 do_classifier_free_guidance=do_classifier_free_guidance,
             )
             height, width = video.shape[-2:]
-        elif isinstance(controlnet, MultiControlNet3DModel):
+        elif isinstance(controlnet, MultiControlNetModel):
             videos = []
 
             for video_ in video:
