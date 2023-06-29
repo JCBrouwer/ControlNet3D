@@ -11,3 +11,4 @@ yt-dlp
 av
 jsonlines
 einops
+tqdm
