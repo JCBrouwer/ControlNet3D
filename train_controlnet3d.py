@@ -32,23 +32,19 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from diffusers import (
-    AutoencoderKL,
-    ControlNetModel,
-    DDPMScheduler,
-    StableDiffusionControlNetPipeline,
-    UNet2DConditionModel,
-    UniPCMultistepScheduler,
-)
+from diffusers import AutoencoderKL, DDPMScheduler, UniPCMultistepScheduler
+from diffusers.models import UNet3DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+
+from controlnet3d import ControlNet3DModel
+from pipeline_controlnet3d import TextToVideoControlNetPipeline
 
 if is_wandb_available():
     import wandb
@@ -59,11 +55,11 @@ check_min_version("0.18.0.dev0")
 logger = get_logger(__name__)
 
 
-def image_grid(imgs, rows, cols):
+def video_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
 
     w, h = imgs[0].size
-    grid = Image.new("RGB", size=(cols * w, rows * h))
+    grid = Video.new("RGB", size=(cols * w, rows * h))
 
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
@@ -75,14 +71,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
 
     controlnet = accelerator.unwrap_model(controlnet)
 
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+    pipeline = TextToVideoControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         unet=unet,
         controlnet=controlnet,
-        safety_checker=None,
         revision=args.revision,
         torch_dtype=weight_dtype,
     )
@@ -98,75 +93,75 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
+    if len(args.validation_video) == len(args.validation_prompt):
+        validation_videos = args.validation_video
         validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
+    elif len(args.validation_video) == 1:
+        validation_videos = args.validation_video * len(args.validation_prompt)
         validation_prompts = args.validation_prompt
     elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
+        validation_videos = args.validation_video
+        validation_prompts = args.validation_prompt * len(args.validation_video)
     else:
         raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
+            "number of `args.validation_video` and `args.validation_prompt` should be checked in `parse_args`"
         )
 
-    image_logs = []
+    video_logs = []
 
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
+    for validation_prompt, validation_video in zip(validation_prompts, validation_videos):
+        validation_video = Video.open(validation_video).convert("RGB")
 
-        images = []
+        videos = []
 
-        for _ in range(args.num_validation_images):
+        for _ in range(args.num_validation_videos):
             with torch.autocast("cuda"):
-                image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
-                ).images[0]
+                video = pipeline(
+                    validation_prompt, validation_video, num_inference_steps=20, generator=generator
+                ).videos[0]
 
-            images.append(image)
+            videos.append(video)
 
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
+        video_logs.append(
+            {"validation_video": validation_video, "videos": videos, "validation_prompt": validation_prompt}
         )
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
+            for log in video_logs:
+                videos = log["videos"]
                 validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
+                validation_video = log["validation_video"]
 
-                formatted_images = []
+                formatted_videos = []
 
-                formatted_images.append(np.asarray(validation_image))
+                formatted_videos.append(np.asarray(validation_video))
 
-                for image in images:
-                    formatted_images.append(np.asarray(image))
+                for video in videos:
+                    formatted_videos.append(np.asarray(video))
 
-                formatted_images = np.stack(formatted_images)
+                formatted_videos = np.stack(formatted_videos)
 
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+                tracker.writer.add_videos(validation_prompt, formatted_videos, step, dataformats="NHWC")
         elif tracker.name == "wandb":
-            formatted_images = []
+            formatted_videos = []
 
-            for log in image_logs:
-                images = log["images"]
+            for log in video_logs:
+                videos = log["videos"]
                 validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
+                validation_video = log["validation_video"]
 
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
+                formatted_videos.append(wandb.Video(validation_video, caption="Controlnet conditioning"))
 
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
+                for video in videos:
+                    video = wandb.Video(video, caption=validation_prompt)
+                    formatted_videos.append(video)
 
-            tracker.log({"validation": formatted_images})
+            tracker.log({"validation": formatted_videos})
         else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            logger.warn(f"video logging not implemented for {tracker.name}")
 
-        return image_logs
+        return video_logs
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -189,19 +184,19 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         raise ValueError(f"{model_class} is not supported.")
 
 
-def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
+def save_model_card(repo_id: str, video_logs=None, base_model=str, repo_folder=None):
     img_str = ""
-    if image_logs is not None:
-        img_str = "You can find some example images below.\n"
-        for i, log in enumerate(image_logs):
-            images = log["images"]
+    if video_logs is not None:
+        img_str = "You can find some example videos below.\n"
+        for i, log in enumerate(video_logs):
+            videos = log["videos"]
             validation_prompt = log["validation_prompt"]
-            validation_image = log["validation_image"]
-            validation_image.save(os.path.join(repo_folder, "image_control.png"))
+            validation_video = log["validation_video"]
+            validation_video.save(os.path.join(repo_folder, "video_control.png"))
             img_str += f"prompt: {validation_prompt}\n"
-            images = [validation_image] + images
-            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
-            img_str += f"![images_{i})](./images_{i}.png)\n"
+            videos = [validation_video] + videos
+            video_grid(videos, 1, len(videos)).save(os.path.join(repo_folder, f"videos_{i}.png"))
+            img_str += f"![videos_{i})](./videos_{i}.png)\n"
 
     yaml = f"""
 ---
@@ -210,7 +205,7 @@ base_model: {base_model}
 tags:
 - stable-diffusion
 - stable-diffusion-diffusers
-- text-to-image
+- text-to-video
 - diffusers
 - controlnet
 inference: true
@@ -276,7 +271,7 @@ def parse_args(input_args=None):
         type=int,
         default=512,
         help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            "The resolution for input videos, all the videos in the train/validation dataset will be resized to this"
             " resolution"
         ),
     )
@@ -455,18 +450,18 @@ def parse_args(input_args=None):
         default=None,
         help=(
             "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+            " https://huggingface.co/docs/datasets/video_dataset#videofolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the videos. Ignored if `dataset_name` is specified."
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
+        "--video_column", type=str, default="video", help="The column of the dataset containing the target video."
     )
     parser.add_argument(
-        "--conditioning_image_column",
+        "--conditioning_video_column",
         type=str,
-        default="conditioning_image",
-        help="The column of the dataset containing the controlnet conditioning image.",
+        default="conditioning_video",
+        help="The column of the dataset containing the controlnet conditioning video.",
     )
     parser.add_argument(
         "--caption_column",
@@ -487,7 +482,7 @@ def parse_args(input_args=None):
         "--proportion_empty_prompts",
         type=float,
         default=0,
-        help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
+        help="Proportion of video prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
     )
     parser.add_argument(
         "--validation_prompt",
@@ -496,27 +491,27 @@ def parse_args(input_args=None):
         nargs="+",
         help=(
             "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
-            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
-            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
+            " Provide either a matching number of `--validation_video`s, a single `--validation_video`"
+            " to be used with all prompts, or a single prompt that will be used with all `--validation_video`s."
         ),
     )
     parser.add_argument(
-        "--validation_image",
+        "--validation_video",
         type=str,
         default=None,
         nargs="+",
         help=(
-            "A set of paths to the controlnet conditioning image be evaluated every `--validation_steps`"
+            "A set of paths to the controlnet conditioning video be evaluated every `--validation_steps`"
             " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
-            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
-            " `--validation_image` that will be used with all `--validation_prompt`s."
+            " a single `--validation_prompt` to be used with all `--validation_video`s, or a single"
+            " `--validation_video` that will be used with all `--validation_prompt`s."
         ),
     )
     parser.add_argument(
-        "--num_validation_images",
+        "--num_validation_videos",
         type=int,
         default=4,
-        help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
+        help="Number of videos to be generated for each `--validation_video`, `--validation_prompt` pair",
     )
     parser.add_argument(
         "--validation_steps",
@@ -524,8 +519,8 @@ def parse_args(input_args=None):
         default=100,
         help=(
             "Run validation every X steps. Validation consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`"
-            " and logging the images."
+            " `args.validation_prompt` multiple times: `args.num_validation_videos`"
+            " and logging the videos."
         ),
     )
     parser.add_argument(
@@ -552,27 +547,27 @@ def parse_args(input_args=None):
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
-    if args.validation_prompt is not None and args.validation_image is None:
-        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
+    if args.validation_prompt is not None and args.validation_video is None:
+        raise ValueError("`--validation_video` must be set if `--validation_prompt` is set")
 
-    if args.validation_prompt is None and args.validation_image is not None:
-        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
+    if args.validation_prompt is None and args.validation_video is not None:
+        raise ValueError("`--validation_prompt` must be set if `--validation_video` is set")
 
     if (
-        args.validation_image is not None
+        args.validation_video is not None
         and args.validation_prompt is not None
-        and len(args.validation_image) != 1
+        and len(args.validation_video) != 1
         and len(args.validation_prompt) != 1
-        and len(args.validation_image) != len(args.validation_prompt)
+        and len(args.validation_video) != len(args.validation_prompt)
     ):
         raise ValueError(
-            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
-            " or the same number of `--validation_prompt`s and `--validation_image`s"
+            "Must provide either 1 `--validation_video`, 1 `--validation_prompt`,"
+            " or the same number of `--validation_prompt`s and `--validation_video`s"
         )
 
     if args.resolution % 8 != 0:
         raise ValueError(
-            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the "
+            "`--resolution` must be divisible by 8 for consistently sized encoded videos between the VAE and the "
             "controlnet encoder."
         )
 
@@ -598,7 +593,7 @@ def make_train_dataset(args, tokenizer, accelerator):
                 args.train_data_dir,
                 cache_dir=args.cache_dir,
             )
-        # See more about loading custom images at
+        # See more about loading custom videos at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
     # Preprocessing the datasets.
@@ -606,14 +601,14 @@ def make_train_dataset(args, tokenizer, accelerator):
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
+    if args.video_column is None:
+        video_column = column_names[0]
+        logger.info(f"video column defaulting to {video_column}")
     else:
-        image_column = args.image_column
-        if image_column not in column_names:
+        video_column = args.video_column
+        if video_column not in column_names:
             raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: "
+                f"`--video_column` value '{args.video_column}' not found in dataset columns. Dataset columns are: "
                 f"{', '.join(column_names)}"
             )
 
@@ -628,14 +623,14 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"{', '.join(column_names)}"
             )
 
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+    if args.conditioning_video_column is None:
+        conditioning_video_column = column_names[2]
+        logger.info(f"conditioning video column defaulting to {conditioning_video_column}")
     else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
+        conditioning_video_column = args.conditioning_video_column
+        if conditioning_video_column not in column_names:
             raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. "
+                f"`--conditioning_video_column` value '{args.conditioning_video_column}' not found in dataset columns. "
                 f"Dataset columns are: {', '.join(column_names)}"
             )
 
@@ -658,7 +653,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
         return inputs.input_ids
 
-    image_transforms = transforms.Compose(
+    video_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
@@ -667,7 +662,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         ]
     )
 
-    conditioning_image_transforms = transforms.Compose(
+    conditioning_video_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
@@ -676,14 +671,14 @@ def make_train_dataset(args, tokenizer, accelerator):
     )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
+        videos = [video.convert("RGB") for video in examples[video_column]]
+        videos = [video_transforms(video) for video in videos]
 
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+        conditioning_videos = [video.convert("RGB") for video in examples[conditioning_video_column]]
+        conditioning_videos = [conditioning_video_transforms(video) for video in conditioning_videos]
 
-        examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
+        examples["pixel_values"] = videos
+        examples["conditioning_pixel_values"] = conditioning_videos
         examples["input_ids"] = tokenize_captions(examples)
 
         return examples
@@ -773,16 +768,16 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
-    unet = UNet2DConditionModel.from_pretrained(
+    unet = UNet3DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = ControlNet3DModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet)
+        controlnet = ControlNet3DModel.from_unet(unet)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -805,7 +800,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = ControlNet3DModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -938,7 +933,7 @@ def main(args):
 
         # tensorboard cannot handle list types for config
         tracker_config.pop("validation_prompt")
-        tracker_config.pop("validation_image")
+        tracker_config.pop("validation_video")
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
@@ -991,18 +986,18 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    image_logs = None
+    video_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
-                # Convert images to latent space
+                # Convert videos to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
+                # Sample a random timestep for each video
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
@@ -1013,13 +1008,13 @@ def main(args):
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                controlnet_video = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=controlnet_image,
+                    controlnet_cond=controlnet_video,
                     return_dict=False,
                 )
 
@@ -1085,7 +1080,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
+                        video_logs = log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
@@ -1113,7 +1108,7 @@ def main(args):
         if args.push_to_hub:
             save_model_card(
                 repo_id,
-                image_logs=image_logs,
+                video_logs=video_logs,
                 base_model=args.pretrained_model_name_or_path,
                 repo_folder=args.output_dir,
             )
