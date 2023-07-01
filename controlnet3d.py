@@ -130,7 +130,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
     def __init__(
         self,
         in_channels: int = 4,
-        conditioning_channels: int = 3,
+        conditioning_channels: int = 2,
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
         down_block_types: Tuple[str] = (
@@ -275,7 +275,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 cross_attention_dim=cross_attention_dim,
                 num_attention_heads=num_attention_heads[i],
-                attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
+                # attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 downsample_padding=downsample_padding,
                 use_linear_projection=use_linear_projection,
                 only_cross_attention=only_cross_attention[i],
@@ -321,7 +321,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         unet: UNet3DConditionModel,
         controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
-        load_weights_from_unet: bool = True,
+        load_weights_from_unet: bool = False,
     ):
         r"""
         Instantiate Controlnet class from UNet3DConditionModel.
@@ -333,10 +333,10 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         """
         controlnet = cls(
             in_channels=unet.config.in_channels,
-            flip_sin_to_cos=unet.config.flip_sin_to_cos,
-            freq_shift=unet.config.freq_shift,
+            # flip_sin_to_cos=unet.config.flip_sin_to_cos,
+            # freq_shift=unet.config.freq_shift,
             down_block_types=unet.config.down_block_types,
-            only_cross_attention=unet.config.only_cross_attention,
+            # only_cross_attention=unet.config.only_cross_attention,
             block_out_channels=unet.config.block_out_channels,
             layers_per_block=unet.config.layers_per_block,
             downsample_padding=unet.config.downsample_padding,
@@ -347,12 +347,12 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             cross_attention_dim=unet.config.cross_attention_dim,
             attention_head_dim=unet.config.attention_head_dim,
             num_attention_heads=unet.config.num_attention_heads,
-            use_linear_projection=unet.config.use_linear_projection,
-            class_embed_type=unet.config.class_embed_type,
-            num_class_embeds=unet.config.num_class_embeds,
-            upcast_attention=unet.config.upcast_attention,
-            resnet_time_scale_shift=unet.config.resnet_time_scale_shift,
-            projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
+            # use_linear_projection=unet.config.use_linear_projection,
+            # class_embed_type=unet.config.class_embed_type,
+            # num_class_embeds=unet.config.num_class_embeds,
+            # upcast_attention=unet.config.upcast_attention,
+            # resnet_time_scale_shift=unet.config.resnet_time_scale_shift,
+            # projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
             controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
         )

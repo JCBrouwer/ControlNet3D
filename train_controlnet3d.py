@@ -484,15 +484,6 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
-
-    if args.dataset_name is not None and args.train_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
-
-    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
-        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
-
     if args.validation_prompt is not None and args.validation_video is None:
         raise ValueError("`--validation_video` must be set if `--validation_prompt` is set")
 
@@ -511,7 +502,7 @@ def parse_args(input_args=None):
             " or the same number of `--validation_prompt`s and `--validation_video`s"
         )
 
-    if args.resolution % 8 != 0:
+    if tuple(np.array(args.resolution) % 8) != (0, 0):
         raise ValueError(
             "`--resolution` must be divisible by 8 for consistently sized encoded videos between the VAE and the "
             "controlnet encoder."
@@ -521,10 +512,9 @@ def parse_args(input_args=None):
 
 
 class ControlNetVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, input_dir, tokenizer, args):
+    def __init__(self, input_dir, tokenizer):
         self.files = glob(f"{input_dir}/*.pt")
         self.tokenizer = tokenizer
-        self.args = args
 
     def __len__(self):
         return len(self.files)
@@ -738,7 +728,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = ControlNetVideoDataset(input_dir=args.train_input_dir, tokenizer=tokenizer)
+    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
