@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+from glob import glob
 import logging
 import math
 import os
@@ -420,22 +421,6 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
         "--train_data_dir",
         type=str,
         default=None,
@@ -444,36 +429,6 @@ def parse_args(input_args=None):
             " https://huggingface.co/docs/datasets/video_dataset#videofolder. In particular, a `metadata.jsonl` file"
             " must exist to provide the captions for the videos. Ignored if `dataset_name` is specified."
         ),
-    )
-    parser.add_argument(
-        "--video_column", type=str, default="video", help="The column of the dataset containing the target video."
-    )
-    parser.add_argument(
-        "--conditioning_video_column",
-        type=str,
-        default="conditioning_video",
-        help="The column of the dataset containing the controlnet conditioning video.",
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions.",
-    )
-    parser.add_argument(
-        "--max_train_samples",
-        type=int,
-        default=None,
-        help=(
-            "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
-        ),
-    )
-    parser.add_argument(
-        "--proportion_empty_prompts",
-        type=float,
-        default=0,
-        help="Proportion of video prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
     )
     parser.add_argument(
         "--validation_prompt",
@@ -565,112 +520,39 @@ def parse_args(input_args=None):
     return args
 
 
-def make_train_dataset(args, tokenizer, accelerator):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+class ControlNetVideoDataset(torch.utils.data.Dataset):
+    def __init__(self, input_dir, tokenizer, args):
+        self.files = glob(f"{input_dir}/*.pt")
+        self.tokenizer = tokenizer
+        self.args = args
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir)
-    else:
-        if args.train_data_dir is not None:
-            dataset = load_dataset(args.train_data_dir, cache_dir=args.cache_dir)
-        # See more about loading custom videos at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+    def __len__(self):
+        return len(self.files)
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    def __getitem__(self, idx):
+        cond_file = self.files[idx]
+        vid_file = cond_file.replace(".pt", ".mp4")
+        cap_file = cond_file.replace(".pt", ".txt")
 
-    # 6. Get the column names for input/target.
-    if args.video_column is None:
-        video_column = column_names[0]
-        logger.info(f"video column defaulting to {video_column}")
-    else:
-        video_column = args.video_column
-        if video_column not in column_names:
-            raise ValueError(
-                f"`--video_column` value '{args.video_column}' not found in dataset columns. Dataset columns are: "
-                f"{', '.join(column_names)}"
-            )
+        pixel_values, _, _ = read_video(vid_file, pts_unit="sec", output_format="TCHW")
 
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        logger.info(f"caption column defaulting to {caption_column}")
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: "
-                f"{', '.join(column_names)}"
-            )
+        conditioning_pixel_values = torch.load(cond_file)
 
-    if args.conditioning_video_column is None:
-        conditioning_video_column = column_names[2]
-        logger.info(f"conditioning video column defaulting to {conditioning_video_column}")
-    else:
-        conditioning_video_column = args.conditioning_video_column
-        if conditioning_video_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_video_column` value '{args.conditioning_video_column}' not found in dataset columns. "
-                f"Dataset columns are: {', '.join(column_names)}"
-            )
+        with open(cap_file, "r") as f:
+            caption = f.read().strip()
+        input_ids = self.tokenizer(
+            caption,
+            max_length=self.tokenizer.model_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    video_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    conditioning_video_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
-    def preprocess_train(examples):
-        videos = [video_transforms(video) for video in examples[video_column]]
-        conditioning_videos = [conditioning_video_transforms(video) for video in examples[conditioning_video_column]]
-
-        examples["pixel_values"] = videos
-        examples["conditioning_pixel_values"] = conditioning_videos
-        examples["input_ids"] = tokenize_captions(examples)
-
-        return examples
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    return train_dataset
+        return {
+            "pixel_values": pixel_values,
+            "conditioning_pixel_values": conditioning_pixel_values,
+            "input_ids": input_ids,
+        }
 
 
 def collate_fn(examples):
@@ -856,7 +738,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = make_train_dataset(args, tokenizer, accelerator)
+    train_dataset = ControlNetVideoDataset(input_dir=args.train_input_dir, tokenizer=tokenizer)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
