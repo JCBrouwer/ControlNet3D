@@ -9,8 +9,7 @@ FORMATS = {144: "160", 240: "133", 360: "134", 480: "135", 720: "136"}
 
 
 class HD_VILA_100m(torch.utils.data.Dataset):
-    def __init__(self, length: int = 24, height: int = 360, seed: int = 42, limit: Optional[int] = None, part: int = 0):
-        self.length = length
+    def __init__(self, height: int = 360, seed: int = 42, limit: Optional[int] = None, part: int = 0):
         self.height = height
         self.format = FORMATS[height]
 
@@ -70,14 +69,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--length", type=int, default=24)
     parser.add_argument("--height", type=int, default=360)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--part", type=int, default=0)
     args = parser.parse_args()
 
-    dataset = HD_VILA_100m(args.length, args.height, args.seed, args.limit, args.part)
+    dataset = HD_VILA_100m(args.height, args.seed, args.limit, args.part)
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=True, num_workers=24, prefetch_factor=10**10
