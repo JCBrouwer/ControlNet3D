@@ -504,6 +504,19 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         if isinstance(module, (CrossAttnDownBlock3D, DownBlock3D)):
             module.gradient_checkpointing = value
 
+    def prepare_condition(self, sample, controlnet_cond, low_memory=False):
+        if low_memory:
+            print("low memory mode")
+            cuda_controlnet_cond = controlnet_cond.cuda()
+            sample = sample + self.controlnet_cond_embedding(cuda_controlnet_cond)
+            del cuda_controlnet_cond
+            torch.cuda.empty_cache()
+        else:
+            controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+            sample = sample + controlnet_cond
+
+        return sample
+
     def forward(
         self,
         sample: torch.FloatTensor,
@@ -517,6 +530,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         guess_mode: bool = False,
         return_dict: bool = True,
+        low_memory: bool = False,
     ) -> Union[ControlNetOutput, Tuple]:
         # check channel order
         channel_order = self.config.controlnet_conditioning_channel_order
@@ -571,11 +585,15 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             emb = emb + class_emb
 
         # 2. pre-process
+        num_frames = sample.shape[2]
+
+        sample = sample.permute(0, 2, 1, 3, 4).reshape((sample.shape[0] * num_frames, -1) + sample.shape[3:])
+        controlnet_cond = controlnet_cond.permute(0, 2, 1, 3, 4).reshape((controlnet_cond.shape[0] * num_frames, -1) + controlnet_cond.shape[3:])
+
         sample = self.conv_in(sample)
 
-        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+        sample = self.prepare_condition(sample, controlnet_cond, low_memory=low_memory)
 
-        sample = sample + controlnet_cond
 
         # 3. down
         down_block_res_samples = (sample,)

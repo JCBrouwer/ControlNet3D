@@ -571,6 +571,7 @@ def main(args):
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        device_placement=False,
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -771,6 +772,7 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    controlnet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -839,36 +841,86 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    def load_noisy_latents(batch):
+        original_pixel_tensor = batch["pixel_values"].to(dtype=weight_dtype)
+        # just take the first 6 frames
+        original_pixel_tensor = original_pixel_tensor[:, :6, :, :, :]
+        original_pixel_tensor_shape = original_pixel_tensor.shape
+
+        reshaped_tensor = original_pixel_tensor.reshape((-1,) + original_pixel_tensor_shape[2:])
+
+        unreshaped_latents = vae.encode(reshaped_tensor.cuda()).latent_dist.sample()
+        unreshaped_latents_shape = unreshaped_latents.shape
+        latents = unreshaped_latents.reshape(original_pixel_tensor_shape[0], 
+                                                unreshaped_latents_shape[1],
+                                                original_pixel_tensor_shape[1], 
+                                                unreshaped_latents_shape[2],
+                                                unreshaped_latents_shape[3])
+        latents = latents * vae.config.scaling_factor
+
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each video
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        del latents
+        del reshaped_tensor
+        del unreshaped_latents
+
+        return noisy_latents, noise, timesteps
+
+
     video_logs = None
+   
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 # Convert videos to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                noisy_latents, noise, timesteps = load_noisy_latents(batch)
+                torch.cuda.empty_cache()
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each video
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                input_ids = batch["input_ids"].squeeze(0).cuda()
+                print("input_ids", input_ids.shape)
+                print("noisy_latents", noisy_latents.shape)
+
+                encoded_text = text_encoder(input_ids)
+                print("encoded_text", type(encoded_text))
 
                 controlnet_video = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                extra_zero_tensor = torch.zeros((1, 1, controlnet_video.shape[2], 
+                                                controlnet_video.shape[3], 
+                                                controlnet_video.shape[4])).to(dtype=weight_dtype, device=controlnet_video.device)
+                controlnet_video = torch.cat((extra_zero_tensor, controlnet_video), dim=1)
+                controlnet_video = controlnet_video[:, :6, :, :, :]
+                controlnet_video = controlnet_video.reshape(controlnet_video.shape[0], 
+                                                            controlnet_video.shape[2],
+                                                            controlnet_video.shape[1],
+                                                            controlnet_video.shape[3],
+                                                            controlnet_video.shape[4])
+
+
+                print("controlnet_video", controlnet_video.shape)
+                num_frames = noisy_latents.shape[2]
+
+                encoder_hidden_states = encoded_text[0]
+                print("encoder_hidden_states", encoder_hidden_states.shape)
+
+
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states.repeat(num_frames, 1, 1),
                     controlnet_cond=controlnet_video,
                     return_dict=False,
+                    low_memory=True,
                 )
 
                 # Predict the noise residual
@@ -889,6 +941,10 @@ def main(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                
+                print("model_pred", model_pred.shape)
+                print("target", target.shape)
+
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
