@@ -46,28 +46,17 @@ class PseudoConv3d(nn.Conv2d):
             nn.init.dirac_(self.conv_temporal.weight.data)  # initialized to be identity
             nn.init.zeros_(self.conv_temporal.bias.data)
 
-    def forward(self, x):
-        b = x.shape[0]
-
-        is_video = x.ndim == 5
-        if is_video:
-            x = rearrange(x, "b c f h w -> (b f) c h w")
-
+    def forward(self, x, num_frames=1):
         x = super().forward(x)
 
-        if is_video:
-            x = rearrange(x, "(b f) c h w -> b c f h w", b=b)
+        if self.conv_temporal is not None:
+            *_, h, w = x.shape
 
-        if self.conv_temporal is None or not is_video:
-            return x
+            x = rearrange(x, "(b f) c h w -> (b h w) c f", f=num_frames)
 
-        *_, h, w = x.shape
+            x = self.conv_temporal(x)
 
-        x = rearrange(x, "b c f h w -> (b h w) c f")
-
-        x = self.conv_temporal(x)
-
-        x = rearrange(x, "(b h w) c f -> b c f h w", h=h, w=w)
+            x = rearrange(x, "(b h w) c f -> (b f) c h w", h=h, w=w)
 
         return x
 
@@ -91,7 +80,7 @@ class ControlNet3DConditioningEmbedding(nn.Module):
     def __init__(
         self,
         conditioning_embedding_channels: int,
-        conditioning_channels: int = 3,
+        conditioning_channels: int = 2,
         block_out_channels: Tuple[int] = (16, 32, 96, 256),
     ):
         super().__init__()
@@ -110,15 +99,15 @@ class ControlNet3DConditioningEmbedding(nn.Module):
             PseudoConv3d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
         )
 
-    def forward(self, conditioning):
-        embedding = self.conv_in(conditioning)
+    def forward(self, conditioning, num_frames=1):
+        embedding = self.conv_in(conditioning, num_frames=num_frames)
         embedding = F.silu(embedding)
 
         for block in self.blocks:
-            embedding = block(embedding)
+            embedding = block(embedding, num_frames=num_frames)
             embedding = F.silu(embedding)
 
-        embedding = self.conv_out(embedding)
+        embedding = self.conv_out(embedding, num_frames=num_frames)
 
         return embedding
 
@@ -571,9 +560,13 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             emb = emb + class_emb
 
         # 2. pre-process
-        sample = self.conv_in(sample)
+        num_frames = sample.shape[2]
 
-        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+        sample = rearrange(sample, "b c f h w -> (b f) c h w")
+        sample = self.conv_in(sample, num_frames=num_frames)
+
+        controlnet_cond = rearrange(controlnet_cond, "b c f h w -> (b f) c h w")
+        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond, num_frames=num_frames)
 
         sample = sample + controlnet_cond
 
@@ -587,9 +580,10 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    num_frames=num_frames,
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, num_frames=num_frames)
 
             down_block_res_samples += res_samples
 
@@ -601,6 +595,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
                 cross_attention_kwargs=cross_attention_kwargs,
+                num_frames=num_frames,
             )
 
         # 5. Control net blocks
@@ -608,12 +603,12 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         controlnet_down_block_res_samples = ()
 
         for down_block_res_sample, controlnet_block in zip(down_block_res_samples, self.controlnet_down_blocks):
-            down_block_res_sample = controlnet_block(down_block_res_sample)
+            down_block_res_sample = controlnet_block(down_block_res_sample, num_frames=num_frames)
             controlnet_down_block_res_samples = controlnet_down_block_res_samples + (down_block_res_sample,)
 
         down_block_res_samples = controlnet_down_block_res_samples
 
-        mid_block_res_sample = self.controlnet_mid_block(sample)
+        mid_block_res_sample = self.controlnet_mid_block(sample, num_frames=num_frames)
 
         # 6. scaling
         if guess_mode and not self.config.global_pool_conditions:
