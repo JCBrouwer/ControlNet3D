@@ -540,7 +540,7 @@ class ControlNetVideoDataset(torch.utils.data.Dataset):
             return_tensors="pt",
         ).input_ids
 
-        return {"pixel_values": video[:6], "conditioning_pixel_values": cond_video[:, :6], "input_ids": caption_ids}
+        return {"pixel_values": video, "conditioning_pixel_values": cond_video, "input_ids": caption_ids}
 
 
 def collate_fn(examples):
