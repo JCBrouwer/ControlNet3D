@@ -610,6 +610,9 @@ def main(args):
             use_fast=False,
         )
 
+    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
+    conditioning_channels = train_dataset[0]["conditioning_pixel_values"].shape[0]
+
     # import correct text encoder class
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
 
@@ -628,7 +631,7 @@ def main(args):
         controlnet = ControlNet3DModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNet3DModel.from_unet(unet)
+        controlnet = ControlNet3DModel.from_unet(unet, conditioning_channels=conditioning_channels)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -726,8 +729,6 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
-
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -769,7 +770,6 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    controlnet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)

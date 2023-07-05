@@ -308,6 +308,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
     def from_unet(
         cls,
         unet: UNet3DConditionModel,
+        conditioning_channels: int = 2,
         controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = False,
@@ -322,6 +323,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         """
         controlnet = cls(
             in_channels=unet.config.in_channels,
+            conditioning_channels=conditioning_channels,
             # flip_sin_to_cos=unet.config.flip_sin_to_cos,
             # freq_shift=unet.config.freq_shift,
             down_block_types=unet.config.down_block_types,
