@@ -14,12 +14,11 @@
 # See the License for the specific language governing permissions and
 
 import argparse
-from glob import glob
 import logging
 import math
 import os
-import random
 import shutil
+from glob import glob
 from pathlib import Path
 from typing import Tuple
 
@@ -39,6 +38,7 @@ from diffusers.models import UNet3DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from einops import rearrange
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
@@ -524,13 +524,15 @@ class ControlNetVideoDataset(torch.utils.data.Dataset):
         vid_file = cond_file.replace(".pt", ".mp4")
         cap_file = cond_file.replace(".pt", ".txt")
 
-        pixel_values, _, _ = read_video(vid_file, pts_unit="sec", output_format="TCHW")
+        video, _, _ = read_video(vid_file, pts_unit="sec", output_format="TCHW")
 
-        conditioning_pixel_values = torch.load(cond_file)
+        cond_video = torch.load(cond_file)
+        cond_video = torch.cat((torch.zeros_like(cond_video[[0]]), cond_video), dim=0)
+        cond_video = rearrange(cond_video, "f c h w -> c f h w")
 
         with open(cap_file, "r") as f:
             caption = f.read().strip()
-        input_ids = self.tokenizer(
+        caption_ids = self.tokenizer(
             caption,
             max_length=self.tokenizer.model_max_length,
             padding="max_length",
@@ -538,11 +540,7 @@ class ControlNetVideoDataset(torch.utils.data.Dataset):
             return_tensors="pt",
         ).input_ids
 
-        return {
-            "pixel_values": pixel_values,
-            "conditioning_pixel_values": conditioning_pixel_values,
-            "input_ids": input_ids,
-        }
+        return {"pixel_values": video, "conditioning_pixel_values": cond_video, "input_ids": caption_ids}
 
 
 def collate_fn(examples):
@@ -552,7 +550,7 @@ def collate_fn(examples):
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    input_ids = torch.stack([example["input_ids"] for example in examples])
+    input_ids = torch.cat([example["input_ids"] for example in examples])
 
     return {
         "pixel_values": pixel_values,
@@ -612,6 +610,9 @@ def main(args):
             use_fast=False,
         )
 
+    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
+    conditioning_channels = train_dataset[0]["conditioning_pixel_values"].shape[0]
+
     # import correct text encoder class
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
 
@@ -630,7 +631,7 @@ def main(args):
         controlnet = ControlNet3DModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNet3DModel.from_unet(unet)
+        controlnet = ControlNet3DModel.from_unet(unet, conditioning_channels=conditioning_channels)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -727,8 +728,6 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
-    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -844,8 +843,10 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 # Convert videos to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                pixel_values = rearrange(batch["pixel_values"], "b f c h w -> (b f) c h w")
+                latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
+                latents *= vae.config.scaling_factor
+                latents = rearrange(latents, "(b f) c h w -> b c f h w", b=batch["pixel_values"].shape[0])
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -866,7 +867,7 @@ def main(args):
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states.repeat(latents.shape[2], 1, 1),
                     controlnet_cond=controlnet_video,
                     return_dict=False,
                 )
