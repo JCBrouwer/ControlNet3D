@@ -80,7 +80,7 @@ class ControlNet3DConditioningEmbedding(nn.Module):
     def __init__(
         self,
         conditioning_embedding_channels: int,
-        conditioning_channels: int = 2,
+        conditioning_channels: int = 3,
         block_out_channels: Tuple[int] = (16, 32, 96, 256),
     ):
         super().__init__()
@@ -119,7 +119,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
     def __init__(
         self,
         in_channels: int = 4,
-        conditioning_channels: int = 2,
+        conditioning_channels: int = 3,
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
         down_block_types: Tuple[str] = (
@@ -275,7 +275,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
     def from_unet(
         cls,
         unet: UNet3DConditionModel,
-        conditioning_channels: int = 2,
+        conditioning_channels: int = 3,
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
     ):

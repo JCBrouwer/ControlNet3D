@@ -528,7 +528,7 @@ def resize_and_crop(video, height, width):
 
 class ControlNetVideoDataset(Dataset):
     def __init__(self, input_dir, resolution):
-        self.files = sorted(glob(f"{input_dir}/*.pt"))
+        self.files = sorted(glob(f"{input_dir}/*.conditioning.mp4"))
         self.width, self.height = resolution
 
     def __len__(self):
@@ -536,8 +536,8 @@ class ControlNetVideoDataset(Dataset):
 
     def __getitem__(self, idx):
         cond_file = self.files[idx]
-        vid_file = cond_file.replace(".pt", ".mp4")
-        cap_file = cond_file.replace(".pt", ".txt")
+        vid_file = os.path.splitext(cond_file.replace(".conditioning", ""))[0] + ".mp4"
+        cap_file = os.path.splitext(cond_file.replace(".conditioning", ""))[0] + ".txt"
 
         video, _, _ = read_video(vid_file, pts_unit="sec", output_format="TCHW")
         video = resize_and_crop(video, self.height, self.width)
@@ -550,7 +550,7 @@ class ControlNetVideoDataset(Dataset):
 
 class ControlNetLatentDataset(Dataset):
     def __init__(self, input_dir, resolution, latents, captions):
-        self.files = sorted(glob(f"{input_dir}/*.pt"))
+        self.files = sorted(glob(f"{input_dir}/*.conditioning.mp4"))
         self.latents = latents
         self.captions = captions
         self.width, self.height = resolution
@@ -562,17 +562,17 @@ class ControlNetLatentDataset(Dataset):
         latents = self.latents[idx]
         caption_embedding = self.captions[idx]
 
-        cond_video = torch.load(self.files[idx])
-        cond_video = torch.cat((torch.zeros_like(cond_video[[0]]), cond_video), dim=0)
+        cond_video, _, _ = read_video(self.files[idx], pts_unit="sec", output_format="TCHW")
         cond_video = resize_and_crop(cond_video, self.height, self.width)
         cond_video = rearrange(cond_video, "f c h w -> c f h w")
 
-        return {"latents": latents[:, :20], "conditioning": cond_video[:, :20], "caption_embedding": caption_embedding}
+        return {"latents": latents, "conditioning": cond_video, "caption_embedding": caption_embedding}
 
 
 @torch.no_grad()
 def prepare_dataset(input_dir, resolution, accelerator, pretrained_model_name_or_path, revision, batch_size=1):
-    cache_file = Path(input_dir).parent / f"{Path(input_dir).stem}-latent.cache"
+    w, h = resolution
+    cache_file = Path(input_dir).parent / f"{Path(input_dir).stem}-{w}x{h}-latent.cache"
 
     if not os.path.exists(cache_file):
         weight_dtype = torch.float32
