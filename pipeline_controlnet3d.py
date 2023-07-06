@@ -307,10 +307,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
             else:
                 attention_mask = None
 
-            prompt_embeds = self.text_encoder(
-                text_input_ids.to(device),
-                attention_mask=attention_mask,
-            )
+            prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
             prompt_embeds = prompt_embeds[0]
 
         prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
@@ -347,11 +344,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
 
             max_length = prompt_embeds.shape[1]
             uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
+                uncond_tokens, padding="max_length", max_length=max_length, truncation=True, return_tensors="pt"
             )
 
             if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
@@ -359,10 +352,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
             else:
                 attention_mask = None
 
-            negative_prompt_embeds = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
+            negative_prompt_embeds = self.text_encoder(uncond_input.input_ids.to(device), attention_mask=attention_mask)
             negative_prompt_embeds = negative_prompt_embeds[0]
 
         if do_classifier_free_guidance:
@@ -388,18 +378,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
         latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
 
         image = self.vae.decode(latents).sample
-        video = (
-            image[None, :]
-            .reshape(
-                (
-                    batch_size,
-                    num_frames,
-                    -1,
-                )
-                + image.shape[2:]
-            )
-            .permute(0, 2, 1, 3, 4)
-        )
+        video = image[None, :].reshape((batch_size, num_frames, -1) + image.shape[2:]).permute(0, 2, 1, 3, 4)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
         video = video.float()
         return video
@@ -568,15 +547,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
             )
 
     def prepare_video(
-        self,
-        video,
-        width,
-        height,
-        batch_size,
-        num_images_per_prompt,
-        device,
-        dtype,
-        do_classifier_free_guidance=False,
+        self, video, width, height, batch_size, num_images_per_prompt, device, dtype, do_classifier_free_guidance=False
     ):
         video = self.control_video_processor.preprocess(video, height=height, width=width).to(dtype=torch.float32)
         video_batch_size = video.shape[0]
@@ -623,10 +594,7 @@ class TextToVideoControlNetPipeline(DiffusionPipeline, TextualInversionLoaderMix
 
     # override DiffusionPipeline
     def save_pretrained(
-        self,
-        save_directory: Union[str, os.PathLike],
-        safe_serialization: bool = False,
-        variant: Optional[str] = None,
+        self, save_directory: Union[str, os.PathLike], safe_serialization: bool = False, variant: Optional[str] = None
     ):
         if isinstance(self.controlnet, ControlNet3DModel):
             super().save_pretrained(save_directory, safe_serialization, variant)

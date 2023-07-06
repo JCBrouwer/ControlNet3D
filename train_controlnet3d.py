@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import gc
 import logging
 import math
 import os
 import shutil
 from glob import glob
 from pathlib import Path
-from typing import Tuple
 
 import accelerate
 import diffusers
@@ -32,7 +32,6 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
 from diffusers import AutoencoderKL, DDPMScheduler, UniPCMultistepScheduler
 from diffusers.models import UNet3DConditionModel
 from diffusers.optimization import get_scheduler
@@ -41,8 +40,9 @@ from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset
 from torchvision.io import read_video, write_video
+from torchvision.transforms.functional import center_crop, resize
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -58,16 +58,23 @@ check_min_version("0.18.0.dev0")
 logger = get_logger(__name__)
 
 
-def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
+@torch.inference_mode()
+def log_validation(unet, controlnet, args, accelerator, weight_dtype, step):
     logger.info("Running validation... ")
 
     controlnet = accelerator.unwrap_model(controlnet)
 
     pipeline = TextToVideoControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
+        vae=AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, torch_dtype=weight_dtype
+        ),
+        text_encoder=import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision
+        ).from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision),
+        tokenizer=AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, use_fast=False
+        ),
         unet=unet,
         controlnet=controlnet,
         revision=args.revision,
@@ -158,9 +165,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=revision,
+        pretrained_model_name_or_path, subfolder="text_encoder", revision=revision
     )
     model_class = text_encoder_config.architectures[0]
 
@@ -240,12 +245,6 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="controlnet-model",
@@ -260,7 +259,8 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
-        type=Tuple[int, int],
+        type=int,
+        nargs=2,
         default=(640, 360),
         help=(
             "The resolution for input videos, all the videos in the train/validation dataset will be resized to this"
@@ -291,10 +291,7 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--checkpoints_total_limit",
-        type=int,
-        default=None,
-        help=("Max number of checkpoints to store."),
+        "--checkpoints_total_limit", type=int, default=None, help=("Max number of checkpoints to store.")
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -353,7 +350,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -511,10 +508,28 @@ def parse_args(input_args=None):
     return args
 
 
-class ControlNetVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, input_dir, tokenizer):
-        self.files = glob(f"{input_dir}/*.pt")
-        self.tokenizer = tokenizer
+def resize_and_crop(video, height, width):
+    h, w = video.shape[2], video.shape[3]
+
+    if h > height or w > width:
+        # first resize (with aspect ratio preserved) such that the smallest side matches the target resolution
+        h_scale = h / height
+        w_scale = w / width
+        scale = min(h_scale, w_scale)
+        hh = round(h / scale)
+        ww = round(w / scale)
+        video = resize(video, (hh, ww), antialias=True)
+
+    # then center crop to the target resolution
+    video = center_crop(video, (height, width))
+
+    return video
+
+
+class ControlNetVideoDataset(Dataset):
+    def __init__(self, input_dir, resolution):
+        self.files = sorted(glob(f"{input_dir}/*.pt"))
+        self.width, self.height = resolution
 
     def __len__(self):
         return len(self.files)
@@ -525,38 +540,109 @@ class ControlNetVideoDataset(torch.utils.data.Dataset):
         cap_file = cond_file.replace(".pt", ".txt")
 
         video, _, _ = read_video(vid_file, pts_unit="sec", output_format="TCHW")
-
-        cond_video = torch.load(cond_file)
-        cond_video = torch.cat((torch.zeros_like(cond_video[[0]]), cond_video), dim=0)
-        cond_video = rearrange(cond_video, "f c h w -> c f h w")
+        video = resize_and_crop(video, self.height, self.width)
 
         with open(cap_file, "r") as f:
             caption = f.read().strip()
-        caption_ids = self.tokenizer(
-            caption,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids
 
-        return {"pixel_values": video, "conditioning_pixel_values": cond_video, "input_ids": caption_ids}
+        return {"video": video.div(127.5).sub(1), "caption": caption}
+
+
+class ControlNetLatentDataset(Dataset):
+    def __init__(self, input_dir, resolution, latents, captions):
+        self.files = sorted(glob(f"{input_dir}/*.pt"))
+        self.latents = latents
+        self.captions = captions
+        self.width, self.height = resolution
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        latents = self.latents[idx]
+        caption_embedding = self.captions[idx]
+
+        cond_video = torch.load(self.files[idx])
+        cond_video = torch.cat((torch.zeros_like(cond_video[[0]]), cond_video), dim=0)
+        cond_video = resize_and_crop(cond_video, self.height, self.width)
+        cond_video = rearrange(cond_video, "f c h w -> c f h w")
+
+        return {"latents": latents[:, :20], "conditioning": cond_video[:, :20], "caption_embedding": caption_embedding}
+
+
+@torch.no_grad()
+def prepare_dataset(input_dir, resolution, accelerator, pretrained_model_name_or_path, revision, batch_size=1):
+    cache_file = Path(input_dir).parent / f"{Path(input_dir).stem}-latent.cache"
+
+    if not os.path.exists(cache_file):
+        weight_dtype = torch.float32
+        if accelerator.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif accelerator.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
+
+        vae = AutoencoderKL.from_pretrained(
+            pretrained_model_name_or_path, subfolder="vae", revision=revision
+        ).requires_grad_(False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, subfolder="tokenizer", revision=revision, use_fast=False
+        )
+        text_encoder = (
+            import_model_class_from_model_name_or_path(pretrained_model_name_or_path, revision)
+            .from_pretrained(pretrained_model_name_or_path, subfolder="text_encoder", revision=revision)
+            .requires_grad_(False)
+        )
+
+        vae.to(accelerator.device, dtype=weight_dtype)
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+        video_dataset = ControlNetVideoDataset(input_dir, resolution)
+        video_dataloader = DataLoader(
+            video_dataset, batch_size=batch_size, num_workers=8, shuffle=False, pin_memory=True
+        )
+
+        latents, embeddings = [], []
+        for batch in tqdm(video_dataloader, desc="Encoding videos to latents..."):
+            caps = batch["caption"]
+            vids = batch["video"].to(device=accelerator.device, dtype=weight_dtype)
+
+            vids = rearrange(vids, "b f c h w -> (b f) c h w")
+            lats = vae.encode(vids).latent_dist.sample()
+            lats *= vae.config.scaling_factor
+            lats = rearrange(lats, "(b f) c h w -> b c f h w", b=batch_size)
+
+            cap_ids = tokenizer(
+                caps, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            ).input_ids
+            embs = text_encoder(cap_ids.to(device=accelerator.device))[0]
+
+            embeddings.append(embs.cpu())
+            latents.append(lats.cpu())
+        latents, embeddings = torch.cat(latents), torch.cat(embeddings)
+
+        torch.save({"latents": latents, "caption_embedding": embeddings}, cache_file)
+
+        del vae, tokenizer, text_encoder, video_dataset, video_dataloader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    else:
+        cache = torch.load(cache_file)
+        latents, embeddings = cache["latents"], cache["caption_embedding"]
+
+    return ControlNetLatentDataset(input_dir, resolution, latents, embeddings)
 
 
 def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    latents = torch.stack([example["latents"] for example in examples])
+    latents = latents.contiguous().float()
 
-    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+    conditioning = torch.stack([example["conditioning"] for example in examples])
+    conditioning = conditioning.contiguous().float()
 
-    input_ids = torch.cat([example["input_ids"] for example in examples])
+    caption_embedding = torch.stack([example["caption_embedding"] for example in examples]).contiguous().float()
 
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning_pixel_values,
-        "input_ids": input_ids,
-    }
+    return {"latents": latents, "conditioning": conditioning, "caption_embedding": caption_embedding}
 
 
 def main(args):
@@ -573,9 +659,7 @@ def main(args):
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%Y/%m/%d %H:%M:%S",
-        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%Y/%m/%d %H:%M:%S", level=logging.INFO
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
@@ -599,32 +683,20 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load the tokenizer
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=False,
-        )
-
-    train_dataset = ControlNetVideoDataset(input_dir=args.train_data_dir, tokenizer=tokenizer)
-    conditioning_channels = train_dataset[0]["conditioning_pixel_values"].shape[0]
-
-    # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
-
-    # Load scheduler and models
+    # Load scheduler and unet
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-    )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
     unet = UNet3DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
+
+    train_dataset = prepare_dataset(
+        input_dir=args.train_data_dir,
+        resolution=args.resolution,
+        accelerator=accelerator,
+        pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+        revision=args.revision,
+    )
+    conditioning_channels = train_dataset[0]["conditioning"].shape[0]
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
@@ -663,9 +735,7 @@ def main(args):
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    vae.requires_grad_(False)
     unet.requires_grad_(False)
-    text_encoder.requires_grad_(False)
     controlnet.train()
 
     if args.enable_xformers_memory_efficient_attention:
@@ -729,12 +799,13 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataloader = torch.utils.data.DataLoader(
+    train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        pin_memory=True,
     )
 
     # Scheduler and math around the number of training steps.
@@ -767,9 +838,7 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move vae, unet and text_encoder to device and cast to weight_dtype
-    vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -842,15 +911,14 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
-                # Convert videos to latent space
-                pixel_values = rearrange(batch["pixel_values"], "b f c h w -> (b f) c h w")
-                latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
-                latents *= vae.config.scaling_factor
-                latents = rearrange(latents, "(b f) c h w -> b c f h w", b=batch["pixel_values"].shape[0])
+                latents = batch["latents"].to(dtype=weight_dtype)
+                controlnet_video = batch["conditioning"].to(dtype=weight_dtype)
+                encoder_hidden_states = batch["caption_embedding"].to(dtype=weight_dtype)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
+
                 # Sample a random timestep for each video
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
@@ -859,15 +927,10 @@ def main(args):
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                controlnet_video = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states.repeat(latents.shape[2], 1, 1),
+                    encoder_hidden_states=encoder_hidden_states,
                     controlnet_cond=controlnet_video,
                     return_dict=False,
                 )
@@ -934,17 +997,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        video_logs = log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            controlnet,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
+                        video_logs = log_validation(unet, controlnet, args, accelerator, weight_dtype, global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

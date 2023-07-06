@@ -139,15 +139,10 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         cross_attention_dim: int = 1280,
         attention_head_dim: Union[int, Tuple[int]] = 8,
         num_attention_heads: Optional[Union[int, Tuple[int]]] = None,
-        use_linear_projection: bool = False,
-        class_embed_type: Optional[str] = None,
-        num_class_embeds: Optional[int] = None,
+        use_linear_projection: bool = True,
         upcast_attention: bool = False,
         resnet_time_scale_shift: str = "default",
-        projection_class_embeddings_input_dim: Optional[int] = None,
-        controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
-        global_pool_conditions: bool = False,
     ):
         super().__init__()
 
@@ -182,7 +177,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         # input
         conv_in_kernel = 3
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = PseudoConv3d(
+        self.conv_in = nn.Conv2d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
 
@@ -192,34 +187,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         timestep_input_dim = block_out_channels[0]
 
-        self.time_embedding = TimestepEmbedding(
-            timestep_input_dim,
-            time_embed_dim,
-            act_fn=act_fn,
-        )
-
-        # class embedding
-        if class_embed_type is None and num_class_embeds is not None:
-            self.class_embedding = nn.Embedding(num_class_embeds, time_embed_dim)
-        elif class_embed_type == "timestep":
-            self.class_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
-        elif class_embed_type == "identity":
-            self.class_embedding = nn.Identity(time_embed_dim, time_embed_dim)
-        elif class_embed_type == "projection":
-            if projection_class_embeddings_input_dim is None:
-                raise ValueError(
-                    "`class_embed_type`: 'projection' requires `projection_class_embeddings_input_dim` be set"
-                )
-            # The projection `class_embed_type` is the same as the timestep `class_embed_type` except
-            # 1. the `class_labels` inputs are not first converted to sinusoidal embeddings
-            # 2. it projects from an arbitrary input dimension.
-            #
-            # Note that `TimestepEmbedding` is quite general, being mainly linear layers and activations.
-            # When used for embedding actual timesteps, the timesteps are first converted to sinusoidal embeddings.
-            # As a result, `TimestepEmbedding` can be passed arbitrary vectors.
-            self.class_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
-        else:
-            self.class_embedding = None
+        self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim, act_fn=act_fn)
 
         # control net conditioning embedding
         self.controlnet_cond_embedding = ControlNet3DConditioningEmbedding(
@@ -264,7 +232,6 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 cross_attention_dim=cross_attention_dim,
                 num_attention_heads=num_attention_heads[i],
-                # attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 downsample_padding=downsample_padding,
                 use_linear_projection=use_linear_projection,
                 only_cross_attention=only_cross_attention[i],
@@ -309,9 +276,8 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         cls,
         unet: UNet3DConditionModel,
         conditioning_channels: int = 2,
-        controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
-        load_weights_from_unet: bool = False,
+        load_weights_from_unet: bool = True,
     ):
         r"""
         Instantiate Controlnet class from UNet3DConditionModel.
@@ -324,10 +290,7 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         controlnet = cls(
             in_channels=unet.config.in_channels,
             conditioning_channels=conditioning_channels,
-            # flip_sin_to_cos=unet.config.flip_sin_to_cos,
-            # freq_shift=unet.config.freq_shift,
             down_block_types=unet.config.down_block_types,
-            # only_cross_attention=unet.config.only_cross_attention,
             block_out_channels=unet.config.block_out_channels,
             layers_per_block=unet.config.layers_per_block,
             downsample_padding=unet.config.downsample_padding,
@@ -338,13 +301,6 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             cross_attention_dim=unet.config.cross_attention_dim,
             attention_head_dim=unet.config.attention_head_dim,
             num_attention_heads=unet.config.num_attention_heads,
-            # use_linear_projection=unet.config.use_linear_projection,
-            # class_embed_type=unet.config.class_embed_type,
-            # num_class_embeds=unet.config.num_class_embeds,
-            # upcast_attention=unet.config.upcast_attention,
-            # resnet_time_scale_shift=unet.config.resnet_time_scale_shift,
-            # projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
-            controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
         )
 
@@ -352,10 +308,6 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
             controlnet.conv_in.load_state_dict(unet.conv_in.state_dict())
             controlnet.time_proj.load_state_dict(unet.time_proj.state_dict())
             controlnet.time_embedding.load_state_dict(unet.time_embedding.state_dict())
-
-            if controlnet.class_embedding:
-                controlnet.class_embedding.load_state_dict(unet.class_embedding.state_dict())
-
             controlnet.down_blocks.load_state_dict(unet.down_blocks.state_dict())
             controlnet.mid_block.load_state_dict(unet.mid_block.state_dict())
 
@@ -502,24 +454,11 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,
         controlnet_cond: torch.FloatTensor,
         conditioning_scale: float = 1.0,
-        class_labels: Optional[torch.Tensor] = None,
         timestep_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        guess_mode: bool = False,
         return_dict: bool = True,
     ) -> Union[ControlNetOutput, Tuple]:
-        # check channel order
-        channel_order = self.config.controlnet_conditioning_channel_order
-
-        if channel_order == "rgb":
-            # in rgb order by default
-            ...
-        elif channel_order == "bgr":
-            controlnet_cond = torch.flip(controlnet_cond, dims=[1])
-        else:
-            raise ValueError(f"unknown `controlnet_conditioning_channel_order`: {channel_order}")
-
         # prepare attention_mask
         if attention_mask is not None:
             attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
@@ -551,21 +490,14 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
 
         emb = self.time_embedding(t_emb, timestep_cond)
 
-        if self.class_embedding is not None:
-            if class_labels is None:
-                raise ValueError("class_labels should be provided when num_class_embeds > 0")
-
-            if self.config.class_embed_type == "timestep":
-                class_labels = self.time_proj(class_labels)
-
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-            emb = emb + class_emb
-
         # 2. pre-process
         num_frames = sample.shape[2]
 
+        emb = emb.repeat_interleave(repeats=num_frames, dim=0)
+        encoder_hidden_states = encoder_hidden_states.repeat_interleave(repeats=num_frames, dim=0)
+
         sample = rearrange(sample, "b c f h w -> (b f) c h w")
-        sample = self.conv_in(sample, num_frames=num_frames)
+        sample = self.conv_in(sample)
 
         controlnet_cond = rearrange(controlnet_cond, "b c f h w -> (b f) c h w")
         controlnet_cond = self.controlnet_cond_embedding(controlnet_cond, num_frames=num_frames)
@@ -613,19 +545,8 @@ class ControlNet3DModel(ModelMixin, ConfigMixin):
         mid_block_res_sample = self.controlnet_mid_block(sample, num_frames=num_frames)
 
         # 6. scaling
-        if guess_mode and not self.config.global_pool_conditions:
-            scales = torch.logspace(-1, 0, len(down_block_res_samples) + 1, device=sample.device)  # 0.1 to 1.0
-
-            scales = scales * conditioning_scale
-            down_block_res_samples = [sample * scale for sample, scale in zip(down_block_res_samples, scales)]
-            mid_block_res_sample = mid_block_res_sample * scales[-1]  # last one
-        else:
-            down_block_res_samples = [sample * conditioning_scale for sample in down_block_res_samples]
-            mid_block_res_sample = mid_block_res_sample * conditioning_scale
-
-        if self.config.global_pool_conditions:
-            down_block_res_samples = [torch.mean(sample, dim=(2, 3), keepdim=True) for sample in down_block_res_samples]
-            mid_block_res_sample = torch.mean(mid_block_res_sample, dim=(2, 3), keepdim=True)
+        down_block_res_samples = [sample * conditioning_scale for sample in down_block_res_samples]
+        mid_block_res_sample = mid_block_res_sample * conditioning_scale
 
         if not return_dict:
             return (down_block_res_samples, mid_block_res_sample)
