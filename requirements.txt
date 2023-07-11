@@ -12,3 +12,4 @@ av
 jsonlines
 einops
 tqdm
+kornia
